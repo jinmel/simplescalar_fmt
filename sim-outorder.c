@@ -73,6 +73,38 @@
 #include "dlite.h"
 #include "sim.h"
 
+
+struct FMT_station {
+  struct RUU_station * rs;
+  int mispredict;
+  int branch_penalty;
+  int local_il1_cache;
+  int local_il2_cache;
+  int local_itlb;
+};
+
+static struct FMT_station *FMT;
+static int FMT_fetch;
+static int FMT_head;
+static int FMT_tail;
+static int FMT_size;
+
+static counter_t total_branch_penalty;
+static counter_t total_il1_cache_miss;;
+static counter_t total_il2_cache_miss;
+static counter_t total_itlb_miss;
+
+/* fetch stage miss status variables */
+static int il1_cache_missed;
+static int il2_cache_missed;
+static int itlb_missed;
+
+static void fmt_init(void);
+void fmt_fetch_advance(void);
+void fmt_dispatch_tail_advance(struct RUU_station * rs);
+void fmt_dispatch_head_advance();
+void fmt_inc_cycle();
+
 /*
  * This file implements a very detailed out-of-order issue superscalar
  * processor with a two-level memory system and speculative execution support.
@@ -85,7 +117,6 @@ static struct regs_t regs;
 
 /* simulated memory */
 static struct mem_t *mem = NULL;
-
 
 /*
  * simulator options
@@ -371,6 +402,7 @@ static int spec_mode = FALSE;
 /* cycles until fetch issue resumes */
 static unsigned ruu_fetch_issue_delay = 0;
 
+
 /* perfect prediction enabled */
 static int pred_perfect = FALSE;
 
@@ -499,6 +531,8 @@ il1_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 {
   unsigned int lat;
 
+  il1_cache_missed = TRUE;
+
 if (cache_il2)
     {
       /* access next level of inst cache hierarchy */
@@ -528,6 +562,7 @@ il2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 	      tick_t now)		/* time of access */
 {
   /* this is a miss to the lowest level, so access main memory */
+  il2_cache_missed = TRUE;
   if (cmd == Read)
     return mem_access_latency(bsize);
   else
@@ -549,6 +584,7 @@ itlb_access_fn(enum mem_cmd cmd,	/* access cmd, Read or Write */
 {
   md_addr_t *phy_page_ptr = (md_addr_t *)blk->user_data;
 
+  itlb_missed = TRUE;
   /* no real memory access, however, should have user data space attached */
   assert(phy_page_ptr);
 
@@ -1383,6 +1419,7 @@ static void readyq_init(void);
 static void cv_init(void);
 static void tracer_init(void);
 static void fetch_init(void);
+static void fmt_init(void);
 
 /* initialize the simulator */
 void
@@ -1456,6 +1493,7 @@ sim_load_prog(char *fname,		/* program to load */
   readyq_init();
   ruu_init();
   lsq_init();
+  fmt_init();
 
   /* initialize the DLite debugger */
   dlite_init(simoo_reg_obj, simoo_mem_obj, simoo_mstate_obj);
@@ -4074,8 +4112,10 @@ ruu_dispatch(void)
 
       /* one more instruction executed, speculative or otherwise */
       sim_total_insn++;
-      if (MD_OP_FLAGS(op) & F_CTRL)
+      if (MD_OP_FLAGS(op) & F_CTRL){
 	sim_total_branches++;
+        fmt_dispatch_tail_advance(rs);
+      }
 
       if (!spec_mode)
 	{
@@ -4222,6 +4262,8 @@ fetch_dump(FILE *stream)			/* output stream */
 static int last_inst_missed = FALSE;
 static int last_inst_tmissed = FALSE;
 
+
+
 /* fetch up as many instruction as one branch prediction and one cache line
    acess will support without overflowing the IFETCH -> DISPATCH QUEUE */
 static void
@@ -4300,6 +4342,9 @@ ruu_fetch(void)
 
       /* pre-decode instruction */
       MD_SET_OPCODE(op, inst);
+
+      if (MD_OP_FLAGS(op) & F_CTRL)
+        fmt_fetch_advance();
 
       /* possibly use the BTB target */
       if (pred)
@@ -4614,9 +4659,26 @@ sim_main(void)
 
       /* call instruction fetch unit if it is not blocked */
       if (!ruu_fetch_issue_delay)
+        {
+          /* clear fmt status flags */
+          il2_cache_missed = FALSE;
+          il1_cache_missed = FALSE;
+          itlb_missed = FALSE;
 	ruu_fetch();
+        }
       else
+        {
+          if (il2_cache_missed){
+            FMT[FMT_fetch].local_il2_cache++;
+          }
+          else if(il1_cache_missed){
+            FMT[FMT_fetch].local_il1_cache++;
+          }
+          else if(itlb_missed){
+            FMT[FMT_fetch].local_itlb++;
+          }
 	ruu_fetch_issue_delay--;
+        }
 
       /* update buffer occupancy stats */
       IFQ_count += fetch_num;
@@ -4634,4 +4696,41 @@ sim_main(void)
 	return;
       if (program_complete) return;
     }
+}
+
+static void fmt_init(){
+  int i;
+  /* max number of FMT -> ROB full of outstanding branches  */
+  FMT_size = RUU_size; // size of FMT = size of ROB
+  FMT = calloc(RUU_size,sizeof(struct FMT_station));
+  if(!FMT)
+    fatal("out of virtual memory");
+
+  FMT_fetch = 0;
+  FMT_head = 0;
+  FMT_tail = 0;
+
+  total_branch_penalty = 0;
+  total_il1_cache_miss = 0;
+  total_il2_cache_miss = 0;
+  total_itlb_miss = 0;
+}
+
+void fmt_fetch_advance(){
+  FMT_fetch = (FMT_fetch + 1) % FMT_size;
+  FMT[FMT_fetch].ruu = 0;
+  FMT[FMT_fetch].mispredict = 0;
+  FMT[FMT_fetch].branch_penalty = 0;
+  FMT[FMT_fetch].local_il1_cache = 0;
+  FMT[FMT_fetch].local_il2_cache = 0;
+  FMT[FMT_fetch].local_itlb = 0;
+}
+
+void fmt_dispatch_tail_advance(struct RUU_station * rs){
+  FMT_tail = (FMT_tail +1) % FMT_size;
+  FMT[FMT_tail].rs = rs;
+}
+
+void fmt_dispatch_head_advance(){
+  FMT_head = (FMT_head +1) % FMT_size;
 }
