@@ -531,6 +531,7 @@ dl2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 	      struct cache_blk_t *blk,	/* ptr to block in upper level */
 	      tick_t now)		/* time of access */
 {
+  il2_cache_missed = TRUE;
   dl2_cache_missed = TRUE;
   /* this is a miss to the lowest level, so access main memory */
   if (cmd == Read)
@@ -4723,10 +4724,11 @@ sim_main(void)
           if (branch_misfetched) {
             total_branch_penalty++;
           }
+          
           if (il2_cache_missed){
             FMT[FMT_fetch].local_il2_cache++;
           }
-          if(il1_cache_missed){
+          else if(il1_cache_missed){
             FMT[FMT_fetch].local_il1_cache++;
           }
           
@@ -4754,10 +4756,11 @@ sim_main(void)
         struct RUU_station * lsq = &(LSQ[LSQ_head]);
         /* is the blocking instruction mem insn? */
         if(rs->ea_comp){
-          if(lsq->dl1_miss)
-            total_dl1_cache_miss++;
           if(lsq->dl2_miss)
             total_dl2_cache_miss++;
+          else if(lsq->dl1_miss)
+            total_dl1_cache_miss++;
+
           if(lsq->dtlb_miss)
             total_dtlb_miss++;
         }
@@ -4867,11 +4870,12 @@ void fmt_set_mispredict(struct RUU_station * rs){
 
 void print_results(){
   fprintf(stdout,"================= Interval Analysis ================= \n");
-  fprintf(stdout,"L1 I Cache miss cycles : %12ld\n",total_il1_cache_miss);
-  fprintf(stdout,"L2 I Cache miss cycles : %12ld\n",total_il2_cache_miss);
-  fprintf(stdout,"ITLB miss cycles : %12ld\n",total_itlb_miss);
-  fprintf(stdout,"L1 D Cache miss cycles : %12ld\n",total_dl1_cache_miss);
-  fprintf(stdout,"L2 D Cache miss cycles : %12ld\n",total_dl2_cache_miss);
-  fprintf(stdout,"DTLB miss cycles : %12ld\n",total_dtlb_miss);
-  fprintf(stdout,"Branch penalty cycles : %12ld\n",total_branch_penalty);
+  fprintf(stdout,"L1 I Cache miss cycles : \t\t%12ld\n",total_il1_cache_miss);
+  fprintf(stdout,"L2 I Cache miss cycles : \t\t%12ld\n",total_il2_cache_miss);
+  fprintf(stdout,"ITLB miss cycles : \t\t%12ld\n",total_itlb_miss);
+  fprintf(stdout,"L1 D Cache miss cycles : \t\t%12ld\n",total_dl1_cache_miss);
+  fprintf(stdout,"L2 D Cache miss cycles : \t\t%12ld\n",total_dl2_cache_miss);
+  fprintf(stdout,"DTLB miss cycles : \t\t%12ld\n",total_dtlb_miss);
+  fprintf(stdout,"Branch penalty cycles : \t\t%12ld\n",total_branch_penalty);
+  fprintf(stdout,"Total instructions : \t\t%12ld\n",sim_num_insn);
 }
