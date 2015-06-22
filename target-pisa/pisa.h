@@ -298,7 +298,6 @@ extern char *md_fu2name[];
 
 /* enum md_opcode -> opcode flags, used by simulators */
 #define MD_OP_FLAGS(OP)		(md_op2flags[OP])
-#define MD_IS_BRANCH(OP) (MD_OP_FLAGS(op) & F_CTRL)
 extern unsigned int md_op2flags[];
 
 /* integer register specifiers */

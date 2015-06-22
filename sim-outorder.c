@@ -83,6 +83,12 @@ struct FMT_station {
   int local_itlb;
 };
 
+struct sFMT_station{
+  struct RUU_station * rs;
+  int mispredict;
+  int branch_penalty;
+};
+
 static struct FMT_station *FMT;
 static int FMT_fetch;
 static int FMT_head;
@@ -93,17 +99,29 @@ static counter_t total_branch_penalty;
 static counter_t total_il1_cache_miss;;
 static counter_t total_il2_cache_miss;
 static counter_t total_itlb_miss;
+static counter_t total_dl1_cache_miss;
+static counter_t total_dl2_cache_miss;
+static counter_t total_dtlb_miss;
+
+static counter_t il2_miss_cnt;
+static counter_t debug_cnt;
 
 /* fetch stage miss status variables */
 static int il1_cache_missed;
 static int il2_cache_missed;
 static int itlb_missed;
+static int branch_misfetched;
+static int dl1_cache_missed;
+static int dl2_cache_missed;
+static int dtlb_missed;
 
 static void fmt_init(void);
 void fmt_fetch_advance(void);
 void fmt_dispatch_tail_advance(struct RUU_station * rs);
 void fmt_dispatch_head_advance();
-void fmt_inc_cycle();
+void fmt_cycle();
+void fmt_set_mispredict(struct RUU_station * rs);
+void print_results(void);
 
 /*
  * This file implements a very detailed out-of-order issue superscalar
@@ -477,6 +495,8 @@ dl1_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 {
   unsigned int lat;
 
+  dl1_cache_missed = TRUE;
+
   if (cache_dl2)
     {
       /* access next level of data cache hierarchy */
@@ -511,6 +531,7 @@ dl2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 	      struct cache_blk_t *blk,	/* ptr to block in upper level */
 	      tick_t now)		/* time of access */
 {
+  dl2_cache_missed = TRUE;
   /* this is a miss to the lowest level, so access main memory */
   if (cmd == Read)
     return mem_access_latency(bsize);
@@ -604,6 +625,8 @@ dtlb_access_fn(enum mem_cmd cmd,	/* access cmd, Read or Write */
 	       tick_t now)		/* time of access */
 {
   md_addr_t *phy_page_ptr = (md_addr_t *)blk->user_data;
+
+  dtlb_missed = TRUE;
 
   /* no real memory access, however, should have user data space attached */
   assert(phy_page_ptr);
@@ -1582,6 +1605,10 @@ struct RUU_station {
      operands are known to be read (see lsq_refresh() for details on
      enforcing memory dependencies) */
   int idep_ready[MAX_IDEPS];		/* input operand ready? */
+
+  int dl2_miss;
+  int dl1_miss;
+  int dtlb_miss;
 };
 
 /* non-zero if all register operands are ready, update with MAX_IDEPS */
@@ -2320,6 +2347,10 @@ ruu_commit(void)
       /* commit head entry of RUU */
       RUU_head = (RUU_head + 1) % RUU_size;
       RUU_num--;
+      
+      /* commit head entry of FMT */
+      fmt_dispatch_head_advance();
+
 
       /* one more instruction committed to architected state */
       committed++;
@@ -2487,6 +2518,7 @@ ruu_writeback(void)
 		       /* correct pred? */rs->pred_PC == rs->next_PC,
 		       /* opcode */rs->op,
 		       /* dir predictor update pointer */&rs->dir_update);
+
 	}
 
       /* entered writeback stage, indicate in pipe trace */
@@ -2792,11 +2824,16 @@ ruu_issue(void)
 			      /* no! go to the data cache if addr is valid */
 			      if (cache_dl1 && valid_addr)
 				{
+                                  dl1_cache_missed = FALSE;
+                                  dl2_cache_missed = FALSE;
 				  /* access the cache if non-faulting */
 				  load_lat =
 				    cache_access(cache_dl1, Read,
 						 (rs->addr & ~3), NULL, 4,
 						 sim_cycle, NULL, NULL);
+
+                                  rs->dl1_miss = dl1_cache_missed;
+                                  rs->dl2_miss = dl2_cache_missed;
 				  if (load_lat > cache_dl1_lat)
 				    events |= PEV_CACHEMISS;
 				}
@@ -2810,11 +2847,14 @@ ruu_issue(void)
 			  /* all loads and stores must to access D-TLB */
 			  if (dtlb && MD_VALID_ADDR(rs->addr))
 			    {
+                              dtlb_missed = FALSE;
 			      /* access the D-DLB, NOTE: this code will
 				 initiate speculative TLB misses */
 			      tlb_lat =
 				cache_access(dtlb, Read, (rs->addr & ~3),
 					     NULL, 4, sim_cycle, NULL, NULL);
+
+                              rs->dtlb_miss = dtlb_missed;
 			      if (tlb_lat > 1)
 				events |= PEV_TLBMISS;
 
@@ -4112,9 +4152,19 @@ ruu_dispatch(void)
 
       /* one more instruction executed, speculative or otherwise */
       sim_total_insn++;
+
       if (MD_OP_FLAGS(op) & F_CTRL){
 	sim_total_branches++;
-        fmt_dispatch_tail_advance(rs);
+        fmt_dispatch_tail_advance(rs); //branch dispatched
+        
+        /* branch resolution */
+        if(target_PC != pred_PC && br_pred_taken){
+          /* set mispredict  */
+          fmt_set_mispredict(rs);
+          /* also, advance fetch ptr */
+          fmt_fetch_advance();
+          branch_misfetched = TRUE;
+        }
       }
 
       if (!spec_mode)
@@ -4342,7 +4392,8 @@ ruu_fetch(void)
 
       /* pre-decode instruction */
       MD_SET_OPCODE(op, inst);
-
+      
+      /* if is_branch(op) - add FMT entry */
       if (MD_OP_FLAGS(op) & F_CTRL)
         fmt_fetch_advance();
 
@@ -4664,17 +4715,22 @@ sim_main(void)
           il2_cache_missed = FALSE;
           il1_cache_missed = FALSE;
           itlb_missed = FALSE;
-	ruu_fetch();
+          branch_misfetched = FALSE;
+          ruu_fetch();
         }
       else
         {
+          if (branch_misfetched) {
+            total_branch_penalty++;
+          }
           if (il2_cache_missed){
             FMT[FMT_fetch].local_il2_cache++;
           }
-          else if(il1_cache_missed){
+          if(il1_cache_missed){
             FMT[FMT_fetch].local_il1_cache++;
           }
-          else if(itlb_missed){
+          
+          if(itlb_missed){
             FMT[FMT_fetch].local_itlb++;
           }
 	ruu_fetch_issue_delay--;
@@ -4688,13 +4744,37 @@ sim_main(void)
       LSQ_count += LSQ_num;
       LSQ_fcount += ((LSQ_num == LSQ_size) ? 1 : 0);
 
+      /* is ROB full? */
+      if(RUU_num < RUU_size){
+        /* update branch penalty counters */
+        fmt_cycle();
+      }
+      else{
+        struct RUU_station * rs = &(RUU[RUU_head]);
+        struct RUU_station * lsq = &(LSQ[LSQ_head]);
+        /* is the blocking instruction mem insn? */
+        if(rs->ea_comp){
+          if(lsq->dl1_miss)
+            total_dl1_cache_miss++;
+          if(lsq->dl2_miss)
+            total_dl2_cache_miss++;
+          if(lsq->dtlb_miss)
+            total_dtlb_miss++;
+        }
+      }
+      
       /* go to next cycle */
       sim_cycle++;
 
       /* finish early? */
-      if (max_insts && sim_num_insn >= max_insts)
+      if (max_insts && sim_num_insn >= max_insts){
+        print_results();
 	return;
-      if (program_complete) return;
+      }
+      if (program_complete) {
+        print_results();
+        return;
+      }
     }
 }
 
@@ -4706,19 +4786,31 @@ static void fmt_init(){
   if(!FMT)
     fatal("out of virtual memory");
 
+  /* pointers */
   FMT_fetch = 0;
   FMT_head = 0;
   FMT_tail = 0;
-
+  /* global counters */
   total_branch_penalty = 0;
   total_il1_cache_miss = 0;
   total_il2_cache_miss = 0;
   total_itlb_miss = 0;
+  total_dl1_cache_miss = 0;
+  total_dl2_cache_miss = 0;
+  total_dtlb_miss = 0;
+  /* status flags */
+  il1_cache_missed = FALSE;
+  il2_cache_missed = FALSE;
+  itlb_missed = FALSE;
+  dl1_cache_missed = FALSE;
+  dl2_cache_missed = FALSE;
+  dtlb_missed = FALSE;
+  branch_misfetched = FALSE;
 }
 
 void fmt_fetch_advance(){
   FMT_fetch = (FMT_fetch + 1) % FMT_size;
-  FMT[FMT_fetch].ruu = 0;
+  FMT[FMT_fetch].rs= 0;
   FMT[FMT_fetch].mispredict = 0;
   FMT[FMT_fetch].branch_penalty = 0;
   FMT[FMT_fetch].local_il1_cache = 0;
@@ -4732,5 +4824,54 @@ void fmt_dispatch_tail_advance(struct RUU_station * rs){
 }
 
 void fmt_dispatch_head_advance(){
+  if(FMT[FMT_head].mispredict){
+    /* if mispredicted, don't add ICache misses */
+    total_branch_penalty += FMT[FMT_head].branch_penalty;
+  }
+  else {
+    /* add to global counters */
+    total_il1_cache_miss += FMT[FMT_head].local_il1_cache;
+    total_il2_cache_miss += FMT[FMT_head].local_il2_cache;
+    total_itlb_miss += FMT[FMT_head].local_itlb;
+  }
+  /* advance FMT_head */
   FMT_head = (FMT_head +1) % FMT_size;
+}
+
+void fmt_cycle(){
+  int walk = FMT_head;
+  while(walk != FMT_tail){
+    FMT[walk].branch_penalty++;
+    walk = (walk + 1) % FMT_size;
+  }
+  FMT[walk].branch_penalty++;
+}
+
+void fmt_set_mispredict(struct RUU_station * rs){
+  int walk = FMT_head;
+  int found = 0;
+  while(walk != FMT_tail){
+    if (FMT[walk].rs == rs){
+      FMT[walk].mispredict = 1;
+      found = 1;
+    }
+    walk = (walk + 1) % FMT_size;
+  }
+  if (FMT[walk].rs == rs){
+    FMT[walk].mispredict = 1;
+    found = 1;
+  }
+  if(!found)
+    fatal("FMT entry not found");
+}
+
+void print_results(){
+  fprintf(stdout,"================= Interval Analysis ================= \n");
+  fprintf(stdout,"L1 I Cache miss cycles : %12ld\n",total_il1_cache_miss);
+  fprintf(stdout,"L2 I Cache miss cycles : %12ld\n",total_il2_cache_miss);
+  fprintf(stdout,"ITLB miss cycles : %12ld\n",total_itlb_miss);
+  fprintf(stdout,"L1 D Cache miss cycles : %12ld\n",total_dl1_cache_miss);
+  fprintf(stdout,"L2 D Cache miss cycles : %12ld\n",total_dl2_cache_miss);
+  fprintf(stdout,"DTLB miss cycles : %12ld\n",total_dtlb_miss);
+  fprintf(stdout,"Branch penalty cycles : %12ld\n",total_branch_penalty);
 }
