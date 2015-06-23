@@ -4773,19 +4773,16 @@ sim_main(void)
             total_branch_penalty++;
             total_shared_branch_penalty++;
           }
-          
-          if (il2_cache_missed){
-            FMT[FMT_fetch].local_il2_cache++;
-            shared_il2_cache_miss++;
-          }
-          else if(il1_cache_missed){
-            FMT[FMT_fetch].local_il1_cache++;
-            shared_il1_cache_miss++;
-          }
-
-          if(itlb_missed){
-            FMT[FMT_fetch].local_itlb++;
-            shared_itlb_miss++;
+          else {
+            if (il2_cache_missed){
+              FMT[FMT_fetch].local_il2_cache++;
+            }
+            else if(il1_cache_missed){
+              FMT[FMT_fetch].local_il1_cache++;
+            }
+            if(itlb_missed){
+              FMT[FMT_fetch].local_itlb++;
+            }
           }
 	ruu_fetch_issue_delay--;
         }
