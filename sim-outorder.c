@@ -90,21 +90,29 @@ struct sFMT_station{
 };
 
 static struct FMT_station *FMT;
+static struct sFMT_station *sFMT;
 static int FMT_fetch;
 static int FMT_head;
 static int FMT_tail;
 static int FMT_size;
 
 static counter_t total_branch_penalty;
-static counter_t total_il1_cache_miss;;
+static counter_t total_il1_cache_miss;
 static counter_t total_il2_cache_miss;
 static counter_t total_itlb_miss;
 static counter_t total_dl1_cache_miss;
 static counter_t total_dl2_cache_miss;
 static counter_t total_dtlb_miss;
 
-static counter_t il2_miss_cnt;
-static counter_t debug_cnt;
+static counter_t total_shared_il1_cache_miss;
+static counter_t total_shared_il2_cache_miss;
+static counter_t total_shared_itlb_miss;
+static counter_t total_shared_branch_penalty;
+
+static int shared_il1_cache_miss;
+static int shared_il2_cache_miss;
+static int shared_itlb_miss;
+
 
 /* fetch stage miss status variables */
 static int il1_cache_missed;
@@ -115,12 +123,19 @@ static int dl1_cache_missed;
 static int dl2_cache_missed;
 static int dtlb_missed;
 
+static int sfmt_il1_miss;
+static int sfmt_il2_miss;
+static int sfmt_itlb_miss;
+
 static void fmt_init(void);
 void fmt_fetch_advance(void);
 void fmt_dispatch_tail_advance(struct RUU_station * rs);
 void fmt_dispatch_head_advance();
 void fmt_cycle();
 void fmt_set_mispredict(struct RUU_station * rs);
+void sfmt_set_mispredict(struct RUU_station * rs);
+void clear_miss_bits();
+void sfmt_commit(struct RUU_station * rs);
 void print_results(void);
 
 /*
@@ -531,6 +546,7 @@ dl2_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 	      struct cache_blk_t *blk,	/* ptr to block in upper level */
 	      tick_t now)		/* time of access */
 {
+  sfmt_il2_miss = TRUE;
   il2_cache_missed = TRUE;
   dl2_cache_missed = TRUE;
   /* this is a miss to the lowest level, so access main memory */
@@ -553,6 +569,7 @@ il1_access_fn(enum mem_cmd cmd,		/* access cmd, Read or Write */
 {
   unsigned int lat;
 
+  sfmt_il1_miss = TRUE;
   il1_cache_missed = TRUE;
 
 if (cache_il2)
@@ -607,6 +624,7 @@ itlb_access_fn(enum mem_cmd cmd,	/* access cmd, Read or Write */
   md_addr_t *phy_page_ptr = (md_addr_t *)blk->user_data;
 
   itlb_missed = TRUE;
+  sfmt_itlb_miss = TRUE;
   /* no real memory access, however, should have user data space attached */
   assert(phy_page_ptr);
 
@@ -1610,6 +1628,9 @@ struct RUU_station {
   int dl2_miss;
   int dl1_miss;
   int dtlb_miss;
+  int il1_miss;
+  int il2_miss;
+  int itlb_miss;
 };
 
 /* non-zero if all register operands are ready, update with MAX_IDEPS */
@@ -2350,6 +2371,7 @@ ruu_commit(void)
       RUU_num--;
       
       /* commit head entry of FMT */
+      sfmt_commit(rs);
       fmt_dispatch_head_advance();
 
 
@@ -3048,6 +3070,9 @@ struct fetch_rec {
   struct bpred_update_t dir_update;	/* bpred direction update info */
   int stack_recover_idx;		/* branch predictor RSB index */
   unsigned int ptrace_seq;		/* print trace sequence id */
+  int il1_miss;                         /* sFMT L1 Icache miss */
+  int il2_miss;                         /* sFMT L2 Icache miss */
+  int itlb_miss;                        /* sFMT ITLB miss */
 };
 static struct fetch_rec *fetch_data;	/* IFETCH -> DISPATCH inst queue */
 static int fetch_num;			/* num entries in IF -> DIS queue */
@@ -3819,6 +3844,10 @@ ruu_dispatch(void)
 #endif /* HOST_HAS_QWORD */
   enum md_fault_type fault;
 
+  int il1_status;
+  int il2_status;
+  int itlb_status;
+
   made_check = FALSE;
   n_dispatched = 0;
   while (/* instruction decode B/W left? */
@@ -3846,6 +3875,11 @@ ruu_dispatch(void)
       dir_update_ptr = &(fetch_data[fetch_head].dir_update);
       stack_recover_idx = fetch_data[fetch_head].stack_recover_idx;
       pseq = fetch_data[fetch_head].ptrace_seq;
+
+      /* get Icache miss status */
+      il1_status = fetch_data[fetch_head].il1_miss;
+      il2_status = fetch_data[fetch_head].il2_miss;
+      itlb_status = fetch_data[fetch_head].itlb_miss;
 
       /* decode the inst */
       MD_SET_OPCODE(op, inst);
@@ -4037,6 +4071,11 @@ ruu_dispatch(void)
 	  rs->queued = rs->issued = rs->completed = FALSE;
 	  rs->ptrace_seq = pseq;
 
+          /* set icache miss status for reservation station */
+          rs->il1_miss = il1_status;
+          rs->il2_miss = il2_status;
+          rs->itlb_miss = itlb_status;
+
 	  /* split ld/st's into two operations: eff addr comp + mem access */
 	  if (MD_OP_FLAGS(op) & F_MEM)
 	    {
@@ -4162,6 +4201,7 @@ ruu_dispatch(void)
         if(target_PC != pred_PC && br_pred_taken){
           /* set mispredict  */
           fmt_set_mispredict(rs);
+          sfmt_set_mispredict(rs);
           /* also, advance fetch ptr */
           fmt_fetch_advance();
           branch_misfetched = TRUE;
@@ -4350,6 +4390,8 @@ ruu_fetch(void)
 	  lat = cache_il1_lat;
 	  if (cache_il1)
 	    {
+              sfmt_il1_miss = FALSE;
+              sfmt_il2_miss = FALSE;
 	      /* access the I-cache */
 	      lat =
 		cache_access(cache_il1, Read, IACOMPRESS(fetch_regs_PC),
@@ -4363,6 +4405,7 @@ ruu_fetch(void)
 	    {
 	      /* access the I-TLB, NOTE: this code will initiate
 		 speculative TLB misses */
+              sfmt_itlb_miss = FALSE;
 	      tlb_lat =
 		cache_access(itlb, Read, IACOMPRESS(fetch_regs_PC),
 			     NULL, ISCOMPRESS(sizeof(md_inst_t)), sim_cycle,
@@ -4444,6 +4487,11 @@ ruu_fetch(void)
       fetch_data[fetch_tail].pred_PC = fetch_pred_PC;
       fetch_data[fetch_tail].stack_recover_idx = stack_recover_idx;
       fetch_data[fetch_tail].ptrace_seq = ptrace_seq++;
+
+      /* set sFMT status variables */
+      fetch_data[fetch_tail].il1_miss = sfmt_il1_miss;
+      fetch_data[fetch_tail].il2_miss = sfmt_il2_miss;
+      fetch_data[fetch_tail].itlb_miss = sfmt_itlb_miss;
 
       /* for pipe trace */
       ptrace_newinst(fetch_data[fetch_tail].ptrace_seq,
@@ -4723,17 +4771,21 @@ sim_main(void)
         {
           if (branch_misfetched) {
             total_branch_penalty++;
+            total_shared_branch_penalty++;
           }
           
           if (il2_cache_missed){
             FMT[FMT_fetch].local_il2_cache++;
+            shared_il2_cache_miss++;
           }
           else if(il1_cache_missed){
             FMT[FMT_fetch].local_il1_cache++;
+            shared_il1_cache_miss++;
           }
-          
+
           if(itlb_missed){
             FMT[FMT_fetch].local_itlb++;
+            shared_itlb_miss++;
           }
 	ruu_fetch_issue_delay--;
         }
@@ -4785,7 +4837,7 @@ static void fmt_init(){
   int i;
   /* max number of FMT -> ROB full of outstanding branches  */
   FMT_size = RUU_size; // size of FMT = size of ROB
-  FMT = calloc(RUU_size,sizeof(struct FMT_station));
+  FMT = calloc(FMT_size,sizeof(struct FMT_station));
   if(!FMT)
     fatal("out of virtual memory");
 
@@ -4809,6 +4861,17 @@ static void fmt_init(){
   dl2_cache_missed = FALSE;
   dtlb_missed = FALSE;
   branch_misfetched = FALSE;
+
+  /* sFMT implementation */
+  sFMT = calloc(FMT_size,sizeof(struct sFMT_station));
+  if(!sFMT)
+    fatal("out of virtual memory");
+  shared_il1_cache_miss = 0;
+  shared_il2_cache_miss = 0;
+  shared_itlb_miss = 0;
+  total_shared_il1_cache_miss = 0;
+  total_shared_il2_cache_miss = 0;
+  total_shared_itlb_miss = 0;
 }
 
 void fmt_fetch_advance(){
@@ -4819,11 +4882,17 @@ void fmt_fetch_advance(){
   FMT[FMT_fetch].local_il1_cache = 0;
   FMT[FMT_fetch].local_il2_cache = 0;
   FMT[FMT_fetch].local_itlb = 0;
+
+  sFMT[FMT_fetch].rs = 0;
+  sFMT[FMT_fetch].mispredict = 0;
+  sFMT[FMT_fetch].branch_penalty = 0;
+  
 }
 
 void fmt_dispatch_tail_advance(struct RUU_station * rs){
   FMT_tail = (FMT_tail +1) % FMT_size;
   FMT[FMT_tail].rs = rs;
+  sFMT[FMT_tail].rs = rs;
 }
 
 void fmt_dispatch_head_advance(){
@@ -4845,9 +4914,11 @@ void fmt_cycle(){
   int walk = FMT_head;
   while(walk != FMT_tail){
     FMT[walk].branch_penalty++;
+    sFMT[walk].branch_penalty++;
     walk = (walk + 1) % FMT_size;
   }
   FMT[walk].branch_penalty++;
+  sFMT[walk].branch_penalty++;
 }
 
 void fmt_set_mispredict(struct RUU_station * rs){
@@ -4868,6 +4939,61 @@ void fmt_set_mispredict(struct RUU_station * rs){
     fatal("FMT entry not found");
 }
 
+void sfmt_set_mispredict(struct RUU_station * rs){
+  int walk = FMT_head;
+  int found = 0;
+  while(walk != FMT_tail){
+    if (sFMT[walk].rs == rs){
+      sFMT[walk].mispredict = 1;
+      found = 1;
+    }
+    walk = (walk + 1) % FMT_size;
+  }
+  if (sFMT[walk].rs == rs){
+    sFMT[walk].mispredict = 1;
+    found = 1;
+  }
+  if(!found)
+    fatal("FMT entry not found");
+}
+
+void sfmt_commit(struct RUU_station * rs){
+  int i;
+  /* is mispredicted branch completed? */
+  if(sFMT[FMT_head].rs == rs || sFMT[FMT_head].mispredict){
+    total_shared_branch_penalty += sFMT[FMT_head].branch_penalty;
+    /* clear sFMT */
+    for (i =0; i < FMT_size; i++){
+      sFMT[i].mispredict = 0;
+      sFMT[i].branch_penalty = 0;
+    }
+  }
+  else if(rs->il1_miss || rs->il2_miss || rs->itlb_miss){
+    /* add to global counters */
+    total_shared_il1_cache_miss += shared_il1_cache_miss;
+    total_shared_il2_cache_miss += shared_il2_cache_miss;
+    total_shared_itlb_miss += shared_itlb_miss;
+  }
+  clear_miss_bits();
+  shared_il1_cache_miss = 0;
+  shared_il2_cache_miss = 0;
+  shared_itlb_miss = 0;
+}
+
+void clear_miss_bits(){
+  int walk = RUU_head;
+  while(walk != RUU_tail) {
+    RUU[walk].il1_miss = 0;
+    RUU[walk].il2_miss = 0;
+    RUU[walk].itlb_miss = 0;
+    walk = (walk + 1) % RUU_size;
+  }
+  RUU[walk].il1_miss = 0;
+  RUU[walk].il2_miss = 0;
+  RUU[walk].itlb_miss = 0;
+}
+
+
 void print_results(){
   fprintf(stdout,"================= Interval Analysis ================= \n");
   fprintf(stdout,"L1 I Cache miss cycles : \t\t%12ld\n",total_il1_cache_miss);
@@ -4877,5 +5003,13 @@ void print_results(){
   fprintf(stdout,"L2 D Cache miss cycles : \t\t%12ld\n",total_dl2_cache_miss);
   fprintf(stdout,"DTLB miss cycles : \t\t%12ld\n",total_dtlb_miss);
   fprintf(stdout,"Branch penalty cycles : \t\t%12ld\n",total_branch_penalty);
+
+  fprintf(stdout,"================= sFMT ================= \n");
+  fprintf(stdout,"L1 I Cache miss cycles : \t\t%12ld\n",total_shared_il1_cache_miss);
+  fprintf(stdout,"L2 I Cache miss cycles : \t\t%12ld\n",total_shared_il2_cache_miss);
+  fprintf(stdout,"ITLB miss cycles : \t\t%12ld\n",total_shared_itlb_miss);
+  fprintf(stdout,"Branch penalty cycles : \t\t%12ld\n",total_shared_branch_penalty);
   fprintf(stdout,"Total instructions : \t\t%12ld\n",sim_num_insn);
 }
+
+
