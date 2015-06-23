@@ -4724,16 +4724,17 @@ sim_main(void)
           if (branch_misfetched) {
             total_branch_penalty++;
           }
+          else {
+            if (il2_cache_missed){
+              FMT[FMT_fetch].local_il2_cache++;
+            }
+            else if(il1_cache_missed){
+              FMT[FMT_fetch].local_il1_cache++;
+            }
           
-          if (il2_cache_missed){
-            FMT[FMT_fetch].local_il2_cache++;
-          }
-          else if(il1_cache_missed){
-            FMT[FMT_fetch].local_il1_cache++;
-          }
-          
-          if(itlb_missed){
-            FMT[FMT_fetch].local_itlb++;
+            if(itlb_missed){
+              FMT[FMT_fetch].local_itlb++;
+            }
           }
 	ruu_fetch_issue_delay--;
         }
